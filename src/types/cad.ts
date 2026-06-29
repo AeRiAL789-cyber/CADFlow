@@ -17,12 +17,17 @@ export interface Point3 extends Point2 {
 
 export type EntityType = 'line' | 'polyline' | 'circle' | 'arc' | 'text' | 'dimension';
 
+export type LineType = 'Continuous' | 'Dashed' | 'Dotted';
+
 export interface BaseEntity {
   id: string;
   type: EntityType;
   layerId: string;
   /** Per-entity colour override; falls back to the layer colour when null. */
   colorOverride: string | null;
+  /** AutoCAD-standard lineweight in mm (Properties palette). */
+  lineWeight?: number;
+  lineType?: LineType;
   /** Free-form provenance: source PDF op index, original CTM, etc. */
   meta?: Record<string, unknown>;
 }
@@ -90,6 +95,7 @@ export interface Layer {
 }
 
 export type DocumentUnits = 'mm' | 'in';
+export type SpaceMode = 'MODEL' | 'LAYOUT1' | 'LAYOUT2';
 
 export interface CadDocument {
   version: string;
@@ -98,6 +104,10 @@ export interface CadDocument {
   origin: Point3;
   layers: Layer[];
   entities: CadEntity[];
+  /** Active model/paper space tab. */
+  activeSpace: SpaceMode;
+  /** Paper-space viewport scale (e.g. 0.02 → 1:50). */
+  viewportScale: number;
 }
 
 /** Default structural layers assigned to imported PDF content. */
@@ -113,6 +123,8 @@ export function createEmptyDocument(): CadDocument {
     origin: { x: 0, y: 0, z: 0 },
     layers: DEFAULT_LAYERS.map((l) => ({ ...l })),
     entities: [],
+    activeSpace: 'MODEL',
+    viewportScale: 1.0,
   };
 }
 

@@ -1,7 +1,7 @@
 // src/state/cadStore.ts
 import { create } from 'zustand';
 import type {
-  CadDocument, CadEntity, Layer, Point3,
+  CadDocument, CadEntity, Layer, Point3, SpaceMode,
 } from '../types/cad';
 import { createEmptyDocument } from '../types/cad';
 import {
@@ -151,10 +151,21 @@ interface CadState {
   offsetDistance: number;
   showGrid: boolean;
 
+  // AutoCAD command-line console log (most recent last)
+  commandHistory: string[];
+
   setDocument: (doc: CadDocument) => void;
   clearDocument: () => void;
   undo: () => void;
   redo: () => void;
+
+  // command line + properties + paper space
+  addCommandLog: (msg: string) => void;
+  executeCommandString: (input: string) => void;
+  updateEntityProperty: (id: string, patch: Partial<CadEntity>) => void;
+  setSpaceMode: (mode: SpaceMode) => void;
+  /** Public history snapshot (alias of the internal recordHistory). */
+  saveHistorySnapshot: () => void;
 
   setTool: (t: Tool) => void;
   setCursor: (p: Point3 | null) => void;
@@ -226,10 +237,86 @@ export const useCadStore = create<CadState>((set, get) => {
     offsetDistance: 10,
     showGrid: true,
 
+    commandHistory: [
+      'CADFlow engine initialized.',
+      'Type a command (LINE, TRIM, OFFSET, REGEN, CLEAR) or use shortcuts (L, TR, O, M).',
+    ],
+
     setDocument: (doc) => set({
       doc, selection: new Set(), draftPoints: [], basePoint: null,
       past: [], future: [], // a fresh import starts a clean history
     }),
+
+    saveHistorySnapshot: () => recordHistory(),
+
+    addCommandLog: (msg) => set((s) => ({ commandHistory: [...s.commandHistory.slice(-199), msg] })),
+
+    // Route a typed command/alias to the real tool state machine + actions.
+    executeCommandString: (input) => {
+      const raw = input.trim();
+      if (!raw) return;
+      const cmd = raw.toLowerCase();
+      const log = get().addCommandLog;
+      log(`Command: ${raw}`);
+
+      const toolMap: Record<string, Tool> = {
+        l: 'DRAW_LINE', line: 'DRAW_LINE',
+        pl: 'DRAW_POLYLINE', polyline: 'DRAW_POLYLINE', pline: 'DRAW_POLYLINE',
+        c: 'DRAW_CIRCLE', circle: 'DRAW_CIRCLE',
+        rec: 'DRAW_RECTANGLE', rectangle: 'DRAW_RECTANGLE', rectang: 'DRAW_RECTANGLE',
+        m: 'MOVE_INTERACTIVE', move: 'MOVE_INTERACTIVE',
+        co: 'COPY_INTERACTIVE', copy: 'COPY_INTERACTIVE',
+        sc: 'SCALE_INTERACTIVE', scale: 'SCALE_INTERACTIVE',
+        ro: 'ROTATE_INTERACTIVE', rotate: 'ROTATE_INTERACTIVE',
+        tr: 'TRIM', trim: 'TRIM',
+        o: 'OFFSET', offset: 'OFFSET',
+        di: 'DIMENSION', dim: 'DIMENSION', dimension: 'DIMENSION',
+        mea: 'MEASURE', measure: 'MEASURE', dist: 'MEASURE',
+      };
+
+      if (toolMap[cmd]) {
+        get().setTool(toolMap[cmd]);
+        log(`→ ${toolMap[cmd]} active.`);
+        return;
+      }
+      switch (cmd) {
+        case 'e': case 'erase': case 'delete':
+          get().deleteSelection(); log('Erased current selection.'); break;
+        case 'u': case 'undo':
+          get().undo(); log('Undo.'); break;
+        case 'redo':
+          get().redo(); log('Redo.'); break;
+        case 'regen': case 're':
+          set((s) => ({ doc: { ...s.doc } })); // new ref forces a full viewport rebuild
+          log('Regenerating model — graphics rebuilt.'); break;
+        case 'clear': case 'clr':
+          get().clearDocument(); log('Drawing purged. Origin reset to (0,0,0).'); break;
+        case 'grid':
+          get().toggleGrid(); log(`Grid ${get().showGrid ? 'ON' : 'OFF'}.`); break;
+        case 'ortho':
+          get().toggleOrtho(); log(`Ortho ${get().orthoMode ? 'ON' : 'OFF'}.`); break;
+        case 'sel': case 'select':
+          get().setTool('SELECT'); log('→ SELECT active.'); break;
+        default:
+          log(`Unknown command: "${raw}". Try LINE, TRIM, OFFSET, MOVE, REGEN, CLEAR.`); break;
+      }
+    },
+
+    // Properties palette mutation. Not snapshotted per keystroke (would flood the
+    // history ring); use Undo before the edit if you need to revert a batch.
+    updateEntityProperty: (id, patch) => set((s) => ({
+      doc: {
+        ...s.doc,
+        entities: s.doc.entities.map((e) => (e.id === id ? ({ ...e, ...patch } as CadEntity) : e)),
+      },
+    })),
+
+    setSpaceMode: (activeSpace) => {
+      get().addCommandLog(`Switched to ${activeSpace}.`);
+      set((s) => ({
+        doc: { ...s.doc, activeSpace, viewportScale: activeSpace === 'MODEL' ? 1.0 : 0.02 },
+      }));
+    },
 
     // REGEN / Clear Layout: wipe geometry, selection, draft, and reset origin.
     // Undoable — the pre-clear document is snapshotted onto the history ring.

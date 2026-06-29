@@ -31,6 +31,14 @@ and lets you edit and export to DXF — no server, no backend.
   WebGL groups (undoable).
 - **Grid toggle** — `G` (or the toolbar button) shows/hides the infinite reference grid.
 - **OSNAP tag** — snapping to an Endpoint / Midpoint / Center floats a labelled tag beside the cursor.
+- **Command line** — a docked console with scrollable prompt history; type `LINE`, `TRIM`, `OFFSET`, `MOVE`, `REGEN`,
+  `CLEAR`, etc. (or their aliases) to drive the same tool state machine as the toolbar and keyboard.
+- **Properties palette** — a right-docked inspector that reports computed geometry (length, radius, area, angle, sweep)
+  for the selected entity and edits its lineweight / linetype.
+- **Model & paper space** — `MODEL` / `LAYOUT1` / `LAYOUT2` tabs; layouts switch to a white sheet background, hide the
+  grid, and set a viewport scale (1:50 default).
+- **Status bar + UCS widget** — `GRID` / `ORTHO` toggles and a live X,Y readout; a red-X / green-Y UCS axis indicator
+  pinned to the viewport's lower-left.
 - **Undo / redo** — a 50-step history ring snapshots the document before every commit (`Ctrl+Z` / `Ctrl+Y`).
 - **Directional selection** — drag left→right for a strict **window** (blue, fully-enclosed only) or right→left for a
   **crossing** box (green, anything touched).

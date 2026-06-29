@@ -1,8 +1,8 @@
 // src/components/CadViewport.tsx
-import { useEffect, useRef } from 'react';
+import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { useCadStore, POINT_TOOLS, computeOffset } from '../state/cadStore';
-import type { CadDocument, CadEntity, Point3 } from '../types/cad';
+import type { CadDocument, CadEntity, LineType, Point3, SpaceMode } from '../types/cad';
 
 export interface SnapResult { kind: 'Endpoint' | 'Midpoint' | 'Center'; world: THREE.Vector3; entityId: string; }
 export interface CursorInfo { x: number; y: number; snap: SnapResult | null; }
@@ -162,6 +162,91 @@ function disposeGroup(group: THREE.Group) {
 
 interface OverlayLabel { worldX: number; worldY: number; text: string; }
 
+// ---- Properties palette helpers --------------------------------------------
+const TAU = Math.PI * 2;
+
+/** Computed engineering dimensions of an entity for the inspector. */
+function describeEntity(e: CadEntity): { label: string; value: string }[] {
+  const f = (n: number) => n.toFixed(3);
+  switch (e.type) {
+    case 'line': {
+      const len = Math.hypot(e.end.x - e.start.x, e.end.y - e.start.y);
+      const ang = (Math.atan2(e.end.y - e.start.y, e.end.x - e.start.x) * 180) / Math.PI;
+      return [
+        { label: 'Start', value: `${f(e.start.x)}, ${f(e.start.y)}` },
+        { label: 'End', value: `${f(e.end.x)}, ${f(e.end.y)}` },
+        { label: 'Length', value: f(len) },
+        { label: 'Angle', value: `${ang.toFixed(2)}°` },
+      ];
+    }
+    case 'polyline': {
+      let len = 0;
+      for (let i = 0; i < e.vertices.length - 1; i++) len += Math.hypot(e.vertices[i + 1].x - e.vertices[i].x, e.vertices[i + 1].y - e.vertices[i].y);
+      let area = 0;
+      if (e.closed) {
+        for (let i = 0; i < e.vertices.length; i++) {
+          const a = e.vertices[i], b = e.vertices[(i + 1) % e.vertices.length];
+          area += a.x * b.y - b.x * a.y;
+          len += i === e.vertices.length - 1 ? Math.hypot(b.x - a.x, b.y - a.y) : 0;
+        }
+        area = Math.abs(area) / 2;
+      }
+      const rows = [{ label: 'Vertices', value: String(e.vertices.length) }, { label: 'Closed', value: e.closed ? 'Yes' : 'No' }, { label: 'Length', value: f(len) }];
+      if (e.closed) rows.push({ label: 'Area', value: f(area) });
+      return rows;
+    }
+    case 'circle':
+      return [
+        { label: 'Center', value: `${f(e.center.x)}, ${f(e.center.y)}` },
+        { label: 'Radius', value: f(e.radius) },
+        { label: 'Diameter', value: f(e.radius * 2) },
+        { label: 'Circumference', value: f(TAU * e.radius) },
+        { label: 'Area', value: f(Math.PI * e.radius * e.radius) },
+      ];
+    case 'arc': {
+      let sweep = e.endAngle - e.startAngle;
+      while (sweep <= 0) sweep += TAU;
+      return [
+        { label: 'Center', value: `${f(e.center.x)}, ${f(e.center.y)}` },
+        { label: 'Radius', value: f(e.radius) },
+        { label: 'Arc Length', value: f(sweep * e.radius) },
+        { label: 'Sweep', value: `${((sweep * 180) / Math.PI).toFixed(2)}°` },
+      ];
+    }
+    case 'text':
+      return [
+        { label: 'Position', value: `${f(e.position.x)}, ${f(e.position.y)}` },
+        { label: 'Value', value: e.value },
+        { label: 'Height', value: f(e.height) },
+        { label: 'Rotation', value: `${((e.rotation * 180) / Math.PI).toFixed(2)}°` },
+      ];
+    case 'dimension':
+      return [
+        { label: 'A', value: `${f(e.a.x)}, ${f(e.a.y)}` },
+        { label: 'B', value: `${f(e.b.x)}, ${f(e.b.y)}` },
+        { label: 'Measured', value: f(Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y)) },
+      ];
+  }
+}
+
+function PropGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="space-y-1.5 rounded border border-white/5 bg-panel2 p-2.5">
+      <div className="text-[10px] font-bold uppercase tracking-wider text-accent/80">{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function PropRow({ k, v }: { k: string; v: string }) {
+  return (
+    <div className="flex justify-between gap-2 py-0.5">
+      <span className="text-gray-500">{k}</span>
+      <span className="truncate text-right font-mono text-gray-300">{v}</span>
+    </div>
+  );
+}
+
 export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const mountRef = useRef<HTMLDivElement>(null);
@@ -177,6 +262,35 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
     snapMarker: null as THREE.Mesh | null,
   });
   const labelsRef = useRef<OverlayLabel[]>([]);
+
+  // Reactive reads for the surrounding HUD chrome; the canvas itself stays
+  // driven by the imperative store subscription inside the effect below.
+  const commandHistory = useCadStore((s) => s.commandHistory);
+  const activeSpace = useCadStore((s) => s.doc.activeSpace);
+  const selection = useCadStore((s) => s.selection);
+  const entities = useCadStore((s) => s.doc.entities);
+  const orthoMode = useCadStore((s) => s.orthoMode);
+  const showGrid = useCadStore((s) => s.showGrid);
+  const executeCommandString = useCadStore((s) => s.executeCommandString);
+  const setSpaceMode = useCadStore((s) => s.setSpaceMode);
+  const toggleOrtho = useCadStore((s) => s.toggleOrtho);
+  const toggleGrid = useCadStore((s) => s.toggleGrid);
+  const updateEntityProperty = useCadStore((s) => s.updateEntityProperty);
+
+  const [cmdInput, setCmdInput] = useState('');
+  const commandInputRef = useRef<HTMLInputElement>(null);
+  const historyEndRef = useRef<HTMLDivElement>(null);
+  const coordsRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => { historyEndRef.current?.scrollIntoView({ block: 'end' }); }, [commandHistory]);
+
+  const selectedEntity = entities.find((e) => selection.has(e.id)) ?? null;
+  const handleCmdSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    if (!cmdInput.trim()) return;
+    executeCommandString(cmdInput);
+    setCmdInput('');
+  };
 
   useEffect(() => {
     const wrap = wrapRef.current!;
@@ -216,8 +330,19 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
     scene.add(refs.current.previewGroup);
     Object.assign(refs.current, { renderer, camera, snapMarker });
 
+    // UCS axis indicator (red X / green Y), pinned to the viewport's lower-left.
+    const ucsGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0), new THREE.Vector3(16, 0, 0),
+      new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 16, 0),
+    ]);
+    ucsGeo.setAttribute('color', new THREE.BufferAttribute(
+      new Float32Array([1, 0.35, 0.35, 1, 0.35, 0.35, 0.4, 1, 0.45, 0.4, 1, 0.45]), 3));
+    const ucs = new THREE.LineSegments(ucsGeo, new THREE.LineBasicMaterial({ vertexColors: true }));
+    scene.add(ucs);
+
     const get = useCadStore.getState;
-    grid.visible = get().showGrid;
+    grid.visible = get().showGrid && get().doc.activeSpace === 'MODEL';
+    scene.background = new THREE.Color(get().doc.activeSpace === 'MODEL' ? '#12151b' : '#f4f4f4');
     const raycaster = new THREE.Raycaster();
     raycaster.params.Line = { threshold: 1.5 };
     const ndc = new THREE.Vector2();
@@ -395,6 +520,7 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
       const st = get();
       st.setCursor(world);
       onCursor?.({ x: world.x - st.doc.origin.x, y: world.y - st.doc.origin.y, snap });
+      if (coordsRef.current) coordsRef.current.textContent = `${(world.x - st.doc.origin.x).toFixed(3)}, ${(world.y - st.doc.origin.y).toFixed(3)}`;
 
       // Capture the scale/rotate reference once the cursor leaves the base point.
       if ((st.activeTool === 'SCALE_INTERACTIVE' || st.activeTool === 'ROTATE_INTERACTIVE') && st.basePoint && st.transformRef === null) {
@@ -675,7 +801,9 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
         prevDoc = s.doc; prevSel = s.selection;
         rebuildEntities(s.doc, s.selection);
       }
-      if (grid.visible !== s.showGrid) grid.visible = s.showGrid;
+      const wantGrid = s.showGrid && s.doc.activeSpace === 'MODEL';
+      if (grid.visible !== wantGrid) grid.visible = wantGrid;
+      (scene.background as THREE.Color).set(s.doc.activeSpace === 'MODEL' ? '#12151b' : '#f4f4f4');
       rebuildPreview(s);
     });
 
@@ -683,6 +811,11 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
     const loop = () => {
       raf = requestAnimationFrame(loop);
       if (refs.current.snapMarker) refs.current.snapMarker.scale.setScalar(1 / camera.zoom);
+      // Pin the UCS widget to the lower-left of the live viewport each frame.
+      const r = renderer.domElement.getBoundingClientRect();
+      const ucsW = screenToWorld(r.left + 36, r.bottom - 30);
+      ucs.position.set(ucsW.x, ucsW.y, 0);
+      ucs.scale.setScalar(1 / camera.zoom);
       renderLabels();
       renderer.render(scene, camera);
     };
@@ -710,24 +843,128 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
   }, [onCursor, snapPixelRadius]);
 
   return (
-    <div ref={wrapRef} className="relative w-full h-full">
-      <div ref={mountRef} className="absolute inset-0" />
-      <div ref={overlayRef} className="pointer-events-none absolute inset-0 overflow-hidden">
-        <div ref={boxRef} className="absolute hidden" style={{ display: 'none' }} />
-        <div
-          ref={snapTagRef}
-          className="pointer-events-none absolute z-10 rounded bg-[#ffe169] px-1.5 py-0.5 text-[10px] font-medium text-black"
-          style={{ display: 'none' }}
-        />
+    <div className="flex h-full min-h-0">
+      <div className="flex min-w-0 min-h-0 flex-1 flex-col">
+
+        {/* Model / Paper-space tabs */}
+        <div className="flex border-b border-white/5 bg-panel text-xs text-ink">
+          {(['MODEL', 'LAYOUT1', 'LAYOUT2'] as SpaceMode[]).map((mode) => (
+            <button
+              key={mode}
+              className={`border-r border-white/5 px-4 py-1.5 font-medium tracking-wide transition-colors ${
+                activeSpace === mode ? 'border-b border-b-accent bg-panel2 text-accent' : 'text-ink/70 hover:bg-panel2/50'}`}
+              onClick={() => setSpaceMode(mode)}
+            >{mode}</button>
+          ))}
+        </div>
+
+        {/* Canvas + engine overlays (unchanged engine) */}
+        <div ref={wrapRef} className="relative min-h-0 flex-1">
+          <div ref={mountRef} className="absolute inset-0" />
+          <div ref={overlayRef} className="pointer-events-none absolute inset-0 overflow-hidden">
+            <div ref={boxRef} className="absolute hidden" style={{ display: 'none' }} />
+            <div
+              ref={snapTagRef}
+              className="pointer-events-none absolute z-10 rounded bg-[#ffe169] px-1.5 py-0.5 text-[10px] font-medium text-black"
+              style={{ display: 'none' }}
+            />
+          </div>
+          <input
+            ref={inputRef}
+            type="text"
+            inputMode="decimal"
+            placeholder="dist ⏎"
+            className="absolute z-10 hidden w-24 rounded border border-accent/60 bg-panel2/95 px-2 py-1 font-mono text-xs text-ink outline-none"
+            style={{ display: 'none' }}
+          />
+        </div>
+
+        {/* Docked command-line console */}
+        <div className="flex flex-col border-t border-white/5 bg-panel p-2 font-mono text-xs">
+          <div className="mb-1 h-24 space-y-0.5 overflow-y-auto pr-2">
+            {commandHistory.map((log, i) => (
+              <div key={i} className="whitespace-pre-wrap leading-relaxed text-gray-400">{log}</div>
+            ))}
+            <div ref={historyEndRef} />
+          </div>
+          <form
+            onSubmit={handleCmdSubmit}
+            className="flex items-center rounded border border-white/10 bg-panel2 px-2 focus-within:border-accent"
+          >
+            <span className="mr-2 select-none font-semibold text-accent">COMMAND:</span>
+            <input
+              ref={commandInputRef}
+              type="text"
+              value={cmdInput}
+              onChange={(e) => setCmdInput(e.target.value)}
+              className="flex-1 border-0 bg-transparent p-1 font-mono tracking-wide text-ink outline-none"
+              placeholder="Type a command — LINE, TRIM, OFFSET, MOVE, REGEN, CLEAR…"
+            />
+          </form>
+        </div>
+
+        {/* Status-bar assist tray */}
+        <div className="flex items-center justify-between border-t border-white/5 bg-[#1a1d24] px-3 py-1.5 font-mono text-[11px] text-gray-400 select-none">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={toggleGrid}
+              className={`rounded px-2 py-0.5 font-bold ${showGrid ? 'border border-accent/30 bg-accent/20 text-accent' : 'border border-white/5 bg-panel text-gray-500'}`}
+            >GRID</button>
+            <button
+              onClick={toggleOrtho}
+              className={`rounded px-2 py-0.5 font-bold ${orthoMode ? 'border border-accent/30 bg-accent/20 text-accent' : 'border border-white/5 bg-panel text-gray-500'}`}
+            >ORTHO</button>
+            <span className="ml-1 tracking-wider text-gray-600">{activeSpace}</span>
+          </div>
+          <div className="rounded border border-white/5 bg-panel2 px-2 py-0.5 tracking-wider">
+            X,Y: <span ref={coordsRef} className="text-ink">0.000, 0.000</span>
+          </div>
+        </div>
       </div>
-      <input
-        ref={inputRef}
-        type="text"
-        inputMode="decimal"
-        placeholder="dist ⏎"
-        className="absolute z-10 hidden w-24 rounded border border-accent/60 bg-panel2/95 px-2 py-1 font-mono text-xs text-ink outline-none"
-        style={{ display: 'none' }}
-      />
+
+      {/* Contextual Properties palette */}
+      <div className="flex w-72 shrink-0 flex-col border-l border-white/5 bg-panel p-3 text-xs text-ink">
+        <h3 className="mb-3 border-b border-white/10 pb-2 text-xs font-bold uppercase tracking-wider text-accent">Properties</h3>
+        {selectedEntity ? (
+          <div className="flex-1 space-y-3 overflow-y-auto pr-1">
+            <PropGroup title="General">
+              <PropRow k="ID" v={selectedEntity.id} />
+              <PropRow k="Type" v={selectedEntity.type} />
+              <PropRow k="Layer" v={selectedEntity.layerId} />
+            </PropGroup>
+            <PropGroup title="Geometry">
+              {describeEntity(selectedEntity).map((m) => <PropRow key={m.label} k={m.label} v={m.value} />)}
+            </PropGroup>
+            <PropGroup title="Formatting">
+              <div className="flex items-center justify-between">
+                <span className="text-gray-500">Line Type</span>
+                <select
+                  value={selectedEntity.lineType ?? 'Continuous'}
+                  onChange={(e) => updateEntityProperty(selectedEntity.id, { lineType: e.target.value as LineType })}
+                  className="rounded border border-white/10 bg-panel px-1.5 py-0.5 font-mono text-[11px] text-ink"
+                >
+                  <option value="Continuous">Continuous</option>
+                  <option value="Dashed">Dashed</option>
+                  <option value="Dotted">Dotted</option>
+                </select>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-gray-500">Lineweight</span>
+                <input
+                  type="number" step={0.05} min={0.05}
+                  value={selectedEntity.lineWeight ?? 0.25}
+                  onChange={(e) => updateEntityProperty(selectedEntity.id, { lineWeight: Number(e.target.value) })}
+                  className="w-16 rounded border border-white/10 bg-panel px-1.5 py-0.5 text-right font-mono text-[11px] text-ink"
+                />
+              </div>
+            </PropGroup>
+          </div>
+        ) : (
+          <div className="flex flex-1 flex-col items-center justify-center px-4 text-center text-gray-600">
+            No selection.<br />Pick an entity to inspect its geometry.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

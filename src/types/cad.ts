@@ -86,6 +86,22 @@ export type CadEntity =
   | TextEntity
   | DimensionEntity;
 
+export type GripType = 'ENDPOINT' | 'MIDPOINT' | 'CENTER' | 'QUADRANT';
+
+export interface GripPoint {
+  /** Stable grip id, e.g. 'start', 'end', 'mid', 'center', 'radius', 'vertex_0'. */
+  id: string;
+  position: Point3;
+  type: GripType;
+}
+
+export interface ActiveGripState {
+  entityId: string;
+  gripId: string;
+  /** Deep clone captured at drag start for rubber-band resets. */
+  originalEntityState: CadEntity;
+}
+
 export interface Layer {
   id: string;
   name: string;

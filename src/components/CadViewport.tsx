@@ -2,7 +2,7 @@
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { useCadStore, POINT_TOOLS, computeOffset } from '../state/cadStore';
-import type { CadDocument, CadEntity, LineType, Point3, SpaceMode } from '../types/cad';
+import type { CadDocument, CadEntity, GripPoint, LineType, Point3, SpaceMode } from '../types/cad';
 
 export interface SnapResult { kind: 'Endpoint' | 'Midpoint' | 'Center'; world: THREE.Vector3; entityId: string; }
 export interface CursorInfo { x: number; y: number; snap: SnapResult | null; }
@@ -162,6 +162,34 @@ function disposeGroup(group: THREE.Group) {
 
 interface OverlayLabel { worldX: number; worldY: number; text: string; }
 
+/** Editable grip points exposed for a selected entity. */
+function getGripsForEntity(e: CadEntity): GripPoint[] {
+  switch (e.type) {
+    case 'line':
+      return [
+        { id: 'start', position: e.start, type: 'ENDPOINT' },
+        { id: 'end', position: e.end, type: 'ENDPOINT' },
+        { id: 'mid', position: { x: (e.start.x + e.end.x) / 2, y: (e.start.y + e.end.y) / 2, z: 0 }, type: 'MIDPOINT' },
+      ];
+    case 'polyline':
+      return e.vertices.map((v, idx) => ({ id: `vertex_${idx}`, position: v, type: 'ENDPOINT' }));
+    case 'circle':
+      return [
+        { id: 'center', position: e.center, type: 'CENTER' },
+        { id: 'radius', position: { x: e.center.x + e.radius, y: e.center.y, z: 0 }, type: 'QUADRANT' },
+      ];
+    case 'arc':
+      return [{ id: 'center', position: e.center, type: 'CENTER' }];
+    case 'text':
+      return [{ id: 'position', position: e.position, type: 'ENDPOINT' }];
+    case 'dimension':
+      return [
+        { id: 'a', position: e.a, type: 'ENDPOINT' },
+        { id: 'b', position: e.b, type: 'ENDPOINT' },
+      ];
+  }
+}
+
 // ---- Properties palette helpers --------------------------------------------
 const TAU = Math.PI * 2;
 
@@ -254,6 +282,7 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
   const overlayRef = useRef<HTMLDivElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const snapTagRef = useRef<HTMLDivElement>(null);
+  const gripLayerRef = useRef<HTMLDivElement>(null);
   const refs = useRef({
     renderer: null as THREE.WebGLRenderer | null,
     camera: null as THREE.OrthographicCamera | null,
@@ -299,6 +328,7 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
     const overlay = overlayRef.current!;
     const box = boxRef.current!;
     const snapTag = snapTagRef.current!;
+    const gripLayer = gripLayerRef.current!;
     const width = mount.clientWidth, height = mount.clientHeight;
 
     const scene = new THREE.Scene();
@@ -466,6 +496,7 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
     const onPointerDown = (ev: PointerEvent) => {
       if (ev.button === 2) { panning = true; lastPan = { x: ev.clientX, y: ev.clientY }; return; }
       if (ev.button !== 0) return;
+      if (get().activeGrip) return; // a grip handle is mid-drag — ignore canvas clicks
       const { world } = resolveWorld(ev.clientX, ev.clientY, ev.shiftKey);
       const st = get();
 
@@ -493,6 +524,19 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
         const wpp = (camera.right - camera.left) / camera.zoom / r.width;
         camera.position.x -= dx * wpp;
         camera.position.y += dy * wpp;
+        return;
+      }
+
+      // Grip stretch: drag the picked vertex/endpoint, snapping to OTHER geometry
+      // (not the entity being edited) so a stretch can latch onto neighbours.
+      const ag = get().activeGrip;
+      if (ag) {
+        const snap = findSnap(ev.clientX, ev.clientY);
+        const use = snap && snap.entityId !== ag.entityId ? snap : null;
+        const w = use ? { x: use.world.x, y: use.world.y } : screenToWorld(ev.clientX, ev.clientY);
+        const marker = refs.current.snapMarker!;
+        if (use) { marker.visible = true; marker.position.copy(use.world); } else marker.visible = false;
+        get().moveGripToPosition(ag.entityId, ag.gripId, { x: w.x, y: w.y, z: 0 });
         return;
       }
 
@@ -553,6 +597,7 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
     };
 
     const onPointerUp = (ev: PointerEvent) => {
+      if (get().activeGrip) { get().setActiveGrip(null); refs.current.snapMarker!.visible = false; return; }
       if (ev.button === 2) { panning = false; return; }
       if (ev.button !== 0 || !boxActive) return;
       boxActive = false;
@@ -665,11 +710,26 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
       if (/^[a-zA-Z]$/.test(ev.key)) feedCmd(ev.key.toUpperCase());
     };
 
+    // Grip pointerdown (event-delegated on the grip layer): snapshot history once,
+    // then arm the active grip. window pointermove/up drive the stretch + release.
+    const onGripDown = (ev: PointerEvent) => {
+      const t = ev.target as HTMLElement;
+      const entityId = t.dataset.entityId, gripId = t.dataset.gripId;
+      if (!entityId || !gripId) return;
+      ev.stopPropagation(); ev.preventDefault();
+      const st = get();
+      const entity = st.doc.entities.find((e) => e.id === entityId);
+      if (!entity) return;
+      st.saveHistorySnapshot();
+      st.setActiveGrip({ entityId, gripId, originalEntityState: JSON.parse(JSON.stringify(entity)) });
+    };
+
     const el = renderer.domElement;
     el.addEventListener('wheel', onWheel, { passive: false });
     el.addEventListener('pointerdown', onPointerDown);
     el.addEventListener('dblclick', onDblClick);
     el.addEventListener('contextmenu', onContextMenu);
+    gripLayer.addEventListener('pointerdown', onGripDown);
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('keydown', onKey);
@@ -792,6 +852,51 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
       }
     };
 
+    // Imperative grip overlay — repositioned every frame so handles track pan/zoom
+    // without re-rendering React. Blue idle, red while the grip is being dragged.
+    const gripPool: HTMLDivElement[] = [];
+    const renderGrips = () => {
+      const st = get();
+      if (st.activeTool !== 'SELECT' || st.selection.size === 0) {
+        for (const d of gripPool) d.style.display = 'none';
+        return;
+      }
+      const list: { entityId: string; gripId: string; p: Point3 }[] = [];
+      for (const e of st.doc.entities) {
+        if (!st.selection.has(e.id)) continue;
+        if (st.doc.layers.find((l) => l.id === e.layerId)?.visible === false) continue;
+        for (const g of getGripsForEntity(e)) list.push({ entityId: e.id, gripId: g.id, p: g.position });
+      }
+      while (gripPool.length < list.length) {
+        const d = document.createElement('div');
+        Object.assign(d.style, {
+          position: 'absolute', width: '10px', height: '10px', boxSizing: 'border-box',
+          transform: 'translate(-50%,-50%)', border: '1px solid', cursor: 'move', pointerEvents: 'auto',
+        } as Partial<CSSStyleDeclaration>);
+        gripLayer.appendChild(d);
+        gripPool.push(d);
+      }
+      const wr = wrap.getBoundingClientRect();
+      const ag = st.activeGrip;
+      for (let i = 0; i < gripPool.length; i++) {
+        const d = gripPool[i];
+        if (i < list.length) {
+          const it = list[i];
+          const sc = worldToScreen(new THREE.Vector3(it.p.x, it.p.y, 0));
+          d.style.display = 'block';
+          d.style.left = `${sc.x - wr.left}px`;
+          d.style.top = `${sc.y - wr.top}px`;
+          d.dataset.entityId = it.entityId;
+          d.dataset.gripId = it.gripId;
+          const active = !!ag && ag.entityId === it.entityId && ag.gripId === it.gripId;
+          d.style.background = active ? '#ef4444' : '#2563eb';
+          d.style.borderColor = active ? '#fecaca' : '#bfdbfe';
+        } else {
+          d.style.display = 'none';
+        }
+      }
+    };
+
     let prevDoc = get().doc;
     let prevSel = get().selection;
     rebuildEntities(prevDoc, prevSel);
@@ -817,6 +922,7 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
       ucs.position.set(ucsW.x, ucsW.y, 0);
       ucs.scale.setScalar(1 / camera.zoom);
       renderLabels();
+      renderGrips();
       renderer.render(scene, camera);
     };
     loop();
@@ -829,12 +935,14 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
       el.removeEventListener('pointerdown', onPointerDown);
       el.removeEventListener('dblclick', onDblClick);
       el.removeEventListener('contextmenu', onContextMenu);
+      gripLayer.removeEventListener('pointerdown', onGripDown);
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('keydown', onKey);
       input.removeEventListener('keydown', onInputKey);
       window.removeEventListener('resize', onResize);
       labelPool.forEach((d) => d.remove());
+      gripPool.forEach((d) => d.remove());
       disposeGroup(refs.current.entityGroup);
       disposeGroup(refs.current.previewGroup);
       renderer.dispose();
@@ -877,6 +985,8 @@ export default function CadViewport({ onCursor, snapPixelRadius = 12 }: Props) {
             className="absolute z-10 hidden w-24 rounded border border-accent/60 bg-panel2/95 px-2 py-1 font-mono text-xs text-ink outline-none"
             style={{ display: 'none' }}
           />
+          {/* Interactive grip handles (imperatively positioned each frame). */}
+          <div ref={gripLayerRef} className="pointer-events-none absolute inset-0 z-20 overflow-hidden" />
         </div>
 
         {/* Docked command-line console */}

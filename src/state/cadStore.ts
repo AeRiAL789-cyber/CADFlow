@@ -1,7 +1,7 @@
 // src/state/cadStore.ts
 import { create } from 'zustand';
 import type {
-  CadDocument, CadEntity, Layer, Point3, SpaceMode,
+  ActiveGripState, CadDocument, CadEntity, Layer, Point3, SpaceMode,
 } from '../types/cad';
 import { createEmptyDocument } from '../types/cad';
 import {
@@ -114,7 +114,9 @@ export function computeOffset(
           Mx = (inc.nx + out.nx) / denom;
           My = (inc.ny + out.ny) / denom;
           const mlen = Math.hypot(Mx, My);
-          if (mlen > MITER_LIMIT) { Mx = (Mx / mlen) * MITER_LIMIT; My = (My / mlen) * MITER_LIMIT; }
+          // Miter limit exceeded on a tight corner → truncate to a clean bevel:
+          // cap the offset at `distance` along the bisector instead of spiking.
+          if (mlen > MITER_LIMIT) { Mx /= mlen; My /= mlen; }
         }
       } else {
         const nrm = (inc ?? out)!;
@@ -153,6 +155,11 @@ interface CadState {
 
   // AutoCAD command-line console log (most recent last)
   commandHistory: string[];
+
+  // grip editing
+  activeGrip: ActiveGripState | null;
+  setActiveGrip: (grip: ActiveGripState | null) => void;
+  moveGripToPosition: (entityId: string, gripId: string, target: Point3) => void;
 
   setDocument: (doc: CadDocument) => void;
   clearDocument: () => void;
@@ -241,6 +248,61 @@ export const useCadStore = create<CadState>((set, get) => {
       'CADFlow engine initialized.',
       'Type a command (LINE, TRIM, OFFSET, REGEN, CLEAR) or use shortcuts (L, TR, O, M).',
     ],
+
+    activeGrip: null,
+    setActiveGrip: (activeGrip) => set({ activeGrip }),
+
+    // Grip-drag mutation. Runs every frame during a stretch — NOT snapshotted
+    // here; saveHistorySnapshot() fires once on grip pointerdown instead.
+    moveGripToPosition: (entityId, gripId, target) => set((s) => ({
+      doc: {
+        ...s.doc,
+        entities: s.doc.entities.map((e) => {
+          if (e.id !== entityId) return e;
+          switch (e.type) {
+            case 'line':
+              if (gripId === 'start') return { ...e, start: target };
+              if (gripId === 'end') return { ...e, end: target };
+              if (gripId === 'mid') {
+                const dx = target.x - (e.start.x + e.end.x) / 2;
+                const dy = target.y - (e.start.y + e.end.y) / 2;
+                return {
+                  ...e,
+                  start: { x: e.start.x + dx, y: e.start.y + dy, z: e.start.z },
+                  end: { x: e.end.x + dx, y: e.end.y + dy, z: e.end.z },
+                };
+              }
+              return e;
+            case 'polyline':
+              if (gripId.startsWith('vertex_')) {
+                const idx = parseInt(gripId.slice(7), 10);
+                if (idx >= 0 && idx < e.vertices.length) {
+                  const vertices = e.vertices.slice();
+                  vertices[idx] = target;
+                  return { ...e, vertices };
+                }
+              }
+              return e;
+            case 'circle':
+              if (gripId === 'center') return { ...e, center: target };
+              if (gripId === 'radius') return { ...e, radius: Math.max(1e-6, Math.hypot(target.x - e.center.x, target.y - e.center.y)) };
+              return e;
+            case 'arc':
+              if (gripId === 'center') return { ...e, center: target };
+              return e;
+            case 'text':
+              if (gripId === 'position') return { ...e, position: target };
+              return e;
+            case 'dimension':
+              if (gripId === 'a') return { ...e, a: target };
+              if (gripId === 'b') return { ...e, b: target };
+              return e;
+            default:
+              return e;
+          }
+        }),
+      },
+    })),
 
     setDocument: (doc) => set({
       doc, selection: new Set(), draftPoints: [], basePoint: null,

@@ -27,6 +27,9 @@ and lets you edit and export to DXF — no server, no backend.
 - **Annotation** — Measure (live distance) and aligned Dimension entities with extension lines, arrows, and text.
 - **Interactive transforms** — Move / Copy / Scale / Rotate all wait for a base-point click, then drag-preview the
   selection live (ghosted) before a second click commits; type an exact distance / factor / angle to commit precisely.
+- **Grip editing** — selected entities show draggable handles (blue, red while hot): line endpoints + midpoint,
+  polyline vertices, circle center + radius, arc/text/dimension anchors. Drag to stretch in real time; grips snap to
+  other geometry and the whole stretch is one undo step.
 - **Clear Layout** — one button wipes all geometry, drops selections, resets the origin to `(0,0,0)`, and disposes the
   WebGL groups (undoable).
 - **Grid toggle** — `G` (or the toolbar button) shows/hides the infinite reference grid.

@@ -1,12 +1,13 @@
 // src/state/cadStore.ts
 import { create } from 'zustand';
 import type {
-  ActiveGripState, CadDocument, CadEntity, Layer, Point3, SpaceMode,
+  ActiveGripState, CadDocument, CadEntity, CircleEntity, Layer, Point3, PolylineEntity, SpaceMode,
 } from '../types/cad';
 import { createEmptyDocument } from '../types/cad';
 import {
-  segmentSegment, segmentCircle, paramOnSegment, pointAt, keptSpansAfterTrim,
+  segmentSegment, segmentCircle, circleCircle, paramOnSegment, pointAt, keptSpansAfterTrim,
 } from '../math/intersections';
+import { closestOnSegment, dist } from '../math/geometry';
 import { selectIdsInRect } from '../math/selection';
 
 export type Tool =
@@ -127,6 +128,114 @@ export function computeOffset(
     return { ...src, id: newId, vertices: moved };
   }
   return null;
+}
+
+const TAU = Math.PI * 2;
+const norm = (a: number) => (a < 0 ? a + TAU : a);
+const lerpPt = (a: Point3, b: Point3, t: number): Point3 => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z });
+const dedupePts = (pts: Point3[]): Point3[] => {
+  const out: Point3[] = [];
+  for (const p of pts) {
+    const last = out[out.length - 1];
+    if (!last || Math.hypot(last.x - p.x, last.y - p.y) > 1e-6) out.push(p);
+  }
+  return out;
+};
+
+/**
+ * Trim a polyline: locate the clicked segment, find the nearest cut on either
+ * side of the click, drop that span, and split the path into open polyline(s).
+ * `cutOnSeg` returns the intersection parameters of other geometry along a→b.
+ */
+function trimPolyline(pl: PolylineEntity, hit: Point3, cutOnSeg: (a: Point3, b: Point3) => number[]): CadEntity[] | null {
+  const vs = pl.vertices, n = vs.length;
+  const segCount = pl.closed ? n : n - 1;
+  if (segCount < 1) return null;
+
+  let k = 0, best = Infinity;
+  for (let i = 0; i < segCount; i++) {
+    const d = dist(hit, closestOnSegment(hit, vs[i], vs[(i + 1) % n]));
+    if (d < best) { best = d; k = i; }
+  }
+  const a = vs[k], b = vs[(k + 1) % n];
+  const cuts = cutOnSeg(a, b);
+  if (!cuts.length) return null;
+
+  const hitT = paramOnSegment(hit, a, b);
+  let lo = 0, hi = 1;
+  for (const t of cuts) {
+    if (t <= hitT + 1e-9 && t > lo) lo = t;
+    if (t >= hitT - 1e-9 && t < hi) hi = t;
+  }
+  if (hi - lo < 1e-6) return null;
+
+  const A = lerpPt(a, b, lo), B = lerpPt(a, b, hi);
+  const mk = (verts: Point3[]): CadEntity => ({
+    id: genId('pl'), type: 'polyline', layerId: pl.layerId, colorOverride: pl.colorOverride,
+    vertices: verts, closed: false,
+  });
+
+  const out: CadEntity[] = [];
+  if (pl.closed) {
+    // Removing one span on a closed loop leaves a single open run B → … → A.
+    const path: Point3[] = [B];
+    for (let j = 1; j <= n; j++) path.push(vs[(k + j) % n]);
+    path.push(A);
+    const cleaned = dedupePts(path);
+    if (cleaned.length >= 2) out.push(mk(cleaned));
+  } else {
+    const left = dedupePts([...vs.slice(0, k + 1), A]);
+    const right = dedupePts([B, ...vs.slice(k + 1)]);
+    if (left.length >= 2) out.push(mk(left));
+    if (right.length >= 2) out.push(mk(right));
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Trim a circle: collect every intersection angle from cutting geometry, drop
+ * the arc span under the cursor, and re-emit the remaining spans as arc entities.
+ */
+function trimCircle(circle: CircleEntity, hit: Point3, others: CadEntity[]): CadEntity[] | null {
+  const c = circle.center, r = circle.radius;
+  const pts: { x: number; y: number }[] = [];
+  for (const o of others) {
+    if (o.type === 'line') {
+      for (const h of segmentCircle(o.start, o.end, c, r)) pts.push(h.point);
+    } else if (o.type === 'polyline') {
+      for (let i = 0; i < o.vertices.length - (o.closed ? 0 : 1); i++) {
+        for (const h of segmentCircle(o.vertices[i], o.vertices[(i + 1) % o.vertices.length], c, r)) pts.push(h.point);
+      }
+    } else if (o.type === 'circle') {
+      pts.push(...circleCircle(c, r, o.center, o.radius));
+    }
+  }
+  if (pts.length < 2) return null;
+
+  const angles = pts.map((p) => norm(Math.atan2(p.y - c.y, p.x - c.x))).sort((x, y) => x - y);
+  const uniq: number[] = [];
+  for (const ag of angles) if (!uniq.length || Math.abs(ag - uniq[uniq.length - 1]) > 1e-6) uniq.push(ag);
+  if (uniq.length > 1 && Math.abs(uniq[0] + TAU - uniq[uniq.length - 1]) < 1e-6) uniq.pop();
+  if (uniq.length < 2) return null;
+
+  const clickA = norm(Math.atan2(hit.y - c.y, hit.x - c.x));
+  const m = uniq.length;
+  let removed = 0;
+  for (let i = 0; i < m; i++) {
+    const sA = uniq[i], eA = uniq[(i + 1) % m];
+    const inside = sA < eA ? (clickA >= sA && clickA <= eA) : (clickA >= sA || clickA <= eA);
+    if (inside) { removed = i; break; }
+  }
+
+  const arcs: CadEntity[] = [];
+  for (let i = 0; i < m; i++) {
+    if (i === removed) continue;
+    arcs.push({
+      id: genId('arc'), type: 'arc', layerId: circle.layerId, colorOverride: circle.colorOverride,
+      center: { ...c }, radius: r, startAngle: uniq[i], endAngle: uniq[(i + 1) % m],
+    });
+  }
+  return arcs.length ? arcs : null;
 }
 
 interface CadState {
@@ -563,44 +672,53 @@ export const useCadStore = create<CadState>((set, get) => {
     },
 
     // --- Trim engine --------------------------------------------------------
+    // Line targets split into line spans; polyline targets split the clicked
+    // segment (and the path); circle targets break into arc entities. In every
+    // case the span/arc under the cursor is dropped and the rest survives.
     trimEntity: (targetId, hit) => {
       const s0 = get();
       const target = s0.doc.entities.find((e) => e.id === targetId);
-      if (!target || target.type !== 'line') return; // only line targets are split
+      if (!target) return;
+      const visible = (id: string) => s0.doc.layers.find((l) => l.id === id)?.visible !== false;
+      const others = s0.doc.entities.filter((e) => e.id !== targetId && visible(e.layerId));
 
-      const a = target.start, b = target.end;
-      const visibleLayer = (id: string) => s0.doc.layers.find((l) => l.id === id)?.visible !== false;
-
-      const cuts: number[] = [];
-      for (const other of s0.doc.entities) {
-        if (other.id === targetId || !visibleLayer(other.layerId)) continue;
-        if (other.type === 'line') {
-          const h = segmentSegment(a, b, other.start, other.end);
-          if (h) cuts.push(h.t);
-        } else if (other.type === 'polyline') {
-          for (let i = 0; i < other.vertices.length - (other.closed ? 0 : 1); i++) {
-            const p1 = other.vertices[i];
-            const p2 = other.vertices[(i + 1) % other.vertices.length];
-            const h = segmentSegment(a, b, p1, p2);
-            if (h) cuts.push(h.t);
+      // Intersection parameters of all other geometry along a finite segment a→b.
+      const cutOnSeg = (a: Point3, b: Point3): number[] => {
+        const ts: number[] = [];
+        for (const o of others) {
+          if (o.type === 'line') { const h = segmentSegment(a, b, o.start, o.end); if (h) ts.push(h.t); }
+          else if (o.type === 'polyline') {
+            for (let i = 0; i < o.vertices.length - (o.closed ? 0 : 1); i++) {
+              const h = segmentSegment(a, b, o.vertices[i], o.vertices[(i + 1) % o.vertices.length]);
+              if (h) ts.push(h.t);
+            }
+          } else if (o.type === 'circle') {
+            for (const h of segmentCircle(a, b, o.center, o.radius)) ts.push(h.t);
           }
-        } else if (other.type === 'circle') {
-          for (const h of segmentCircle(a, b, other.center, other.radius)) cuts.push(h.t);
         }
-      }
-      if (!cuts.length) return; // nothing crosses the target
+        return ts;
+      };
 
-      const hitT = paramOnSegment(hit, a, b);
-      const spans = keptSpansAfterTrim(cuts, hitT);
-      const kept: CadEntity[] = spans.map((sp) => ({
-        id: genId('line'), type: 'line', layerId: target.layerId, colorOverride: target.colorOverride,
-        start: { ...pointAt(a, b, sp.t0), z: a.z },
-        end: { ...pointAt(a, b, sp.t1), z: b.z },
-      }));
+      let replacement: CadEntity[] | null = null;
+      if (target.type === 'line') {
+        const a = target.start, b = target.end;
+        const cuts = cutOnSeg(a, b);
+        if (!cuts.length) return;
+        replacement = keptSpansAfterTrim(cuts, paramOnSegment(hit, a, b)).map((sp) => ({
+          id: genId('line'), type: 'line', layerId: target.layerId, colorOverride: target.colorOverride,
+          start: { ...pointAt(a, b, sp.t0), z: a.z },
+          end: { ...pointAt(a, b, sp.t1), z: b.z },
+        }));
+      } else if (target.type === 'polyline') {
+        replacement = trimPolyline(target, hit, cutOnSeg);
+      } else if (target.type === 'circle') {
+        replacement = trimCircle(target, hit, others);
+      }
+      if (!replacement) return; // arcs/text/dimensions, or nothing crosses the target
 
       recordHistory();
       set((s) => ({
-        doc: { ...s.doc, entities: [...s.doc.entities.filter((e) => e.id !== targetId), ...kept] },
+        doc: { ...s.doc, entities: [...s.doc.entities.filter((e) => e.id !== targetId), ...replacement!] },
         selection: new Set(),
       }));
     },

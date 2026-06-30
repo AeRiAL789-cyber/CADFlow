@@ -73,6 +73,25 @@ export function segmentCircle(
 }
 
 /**
+ * Circle ∩ circle. Returns 0 (separate/contained/concentric), 1 (tangent),
+ * or 2 intersection points. Pure radical-line solution.
+ */
+export function circleCircle(c1: Point2, r1: number, c2: Point2, r2: number): Point2[] {
+  const dx = c2.x - c1.x, dy = c2.y - c1.y;
+  const d = Math.hypot(dx, dy);
+  if (d < EPS) return [];                              // concentric
+  if (d > r1 + r2 + EPS || d < Math.abs(r1 - r2) - EPS) return []; // disjoint / nested
+
+  const a = (r1 * r1 - r2 * r2 + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, r1 * r1 - a * a));
+  const xm = c1.x + (a * dx) / d, ym = c1.y + (a * dy) / d;
+  if (h < EPS) return [{ x: xm, y: ym }];              // tangent
+
+  const ox = (-dy / d) * h, oy = (dx / d) * h;
+  return [{ x: xm + ox, y: ym + oy }, { x: xm - ox, y: ym - oy }];
+}
+
+/**
  * Project p onto the (infinite) line through a→b and return the clamped
  * parameter in [0,1]. Used to locate a raycast hit along a trim target.
  */

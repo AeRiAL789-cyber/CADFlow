@@ -20,8 +20,10 @@ and lets you edit and export to DXF — no server, no backend.
   Endpoint/Midpoint/Center screen-space snapping, live coordinate readout relative to a custom origin.
 - **Drafting tools** — a centralized tool state machine: Line, Polyline (rubber-band, Enter/double-click to commit),
   Circle (center-radius), Rectangle, plus interactive Move / Copy with a live base-point→cursor offset.
-- **Modify engines** — Trim (raycast a line target, split it at every intersection with other entities, drop the
-  span under the cursor) and Offset (parallel copy biased to the cursor side; lines, circles, polylines).
+- **Modify engines** — Trim works on **lines, polylines, and circles**: a line splits into spans, a polyline splits at
+  the clicked segment, and a circle breaks into clean math **arc** entities — each at the true intersections with other
+  geometry (line↔line/circle, circle↔circle), dropping the span/arc under the cursor. Offset is a parallel copy biased
+  to the cursor side (lines, circles, polylines, with miter-limit bevels on tight corners).
 - **Drafting constraints** — Ortho mode (or hold Shift) locks to 90° axes; a floating dynamic-input box accepts a
   typed distance and extends along the current heading; Endpoint/Midpoint/Center snapping overrides both.
 - **Annotation** — Measure (live distance) and aligned Dimension entities with extension lines, arrows, and text.

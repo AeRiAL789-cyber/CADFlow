@@ -57,7 +57,7 @@ class TorrentEngineService : Service() {
     fun resume(infoHash: String) = engine.resume(infoHash)
     fun remove(infoHash: String, deleteFiles: Boolean) = engine.remove(infoHash, deleteFiles)
 
-    /** Called by [com.cadflow.torrentvpn.vpn.WireGuardTunnelService] on tunnel state changes. */
+    /** Wired up as [com.cadflow.torrentvpn.vpn.VpnManager.onInterfaceChanged] in MainActivity. */
     fun onVpnInterfaceChanged(tunInterfaceName: String?) = engine.rebindInterface(tunInterfaceName)
 
     private fun buildNotification(): Notification =

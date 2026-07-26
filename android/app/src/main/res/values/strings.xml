@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Torrent VPN Manager</string>
+    <string name="notif_channel_torrent">Torrent transfers</string>
+    <string name="notif_channel_vpn">VPN tunnel</string>
+</resources>
